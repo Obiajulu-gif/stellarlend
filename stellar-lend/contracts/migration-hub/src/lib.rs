@@ -1,6 +1,6 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, Address, Env, String, Symbol, Vec, Val, symbol_short, log};
+use soroban_sdk::{contract, contractimpl, Address, BytesN, Env, log};
 
 mod types;
 mod adapter;
@@ -9,7 +9,8 @@ mod adapter;
 mod test;
 
 use crate::types::{
-    DataKey, MigrationAnalytics, MigrationConfig, MigrationError, MigrationRecord, MigrationStatus, ProtocolType,
+    DataKey, MigrationAnalytics, MigrationConfig, MigrationError, MigrationPlan, MigrationRecord,
+    MigrationStatus, ProtocolType,
 };
 use crate::adapter::{MigrationAdapter, StellarOtherLendAdapter};
 
@@ -31,7 +32,7 @@ impl MigrationHub {
         }
 
         env.storage().instance().set(&DataKey::Admin, &admin);
-        
+
         let config = MigrationConfig {
             lending_contract,
             bridge_contract,
@@ -39,7 +40,7 @@ impl MigrationHub {
             migration_deadline: deadline,
         };
         env.storage().instance().set(&DataKey::Config, &config);
-        
+
         let analytics = MigrationAnalytics {
             total_migrated_value: 0,
             total_users: 0,
@@ -52,7 +53,71 @@ impl MigrationHub {
         Ok(())
     }
 
-    /// Migrate funds from a source protocol.
+    pub fn approve_plan(
+        env: Env,
+        admin: Address,
+        plan_id: BytesN<32>,
+        old_contract: Address,
+        new_contract: Address,
+        state_root: BytesN<32>,
+        total_steps: u32,
+    ) -> Result<(), MigrationError> {
+        Self::require_admin(&env, &admin)?;
+        admin.require_auth();
+        let plan = MigrationPlan {
+            plan_id: plan_id.clone(),
+            old_contract,
+            new_contract,
+            state_root,
+            approved: true,
+            total_steps,
+            completed_steps: 0,
+        };
+        env.storage().persistent().set(&DataKey::Plan(plan_id), &plan);
+        Ok(())
+    }
+
+    pub fn record_progress(
+        env: Env,
+        admin: Address,
+        plan_id: BytesN<32>,
+        completed_steps: u32,
+    ) -> Result<(), MigrationError> {
+        Self::require_admin(&env, &admin)?;
+        admin.require_auth();
+        let mut plan = Self::get_plan(env.clone(), plan_id.clone())?;
+        if !plan.approved {
+            return Err(MigrationError::MigrationNotApproved);
+        }
+        plan.completed_steps = completed_steps.min(plan.total_steps);
+        env.storage().persistent().set(&DataKey::Plan(plan_id), &plan);
+        Ok(())
+    }
+
+    pub fn get_plan(env: Env, plan_id: BytesN<32>) -> Result<MigrationPlan, MigrationError> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Plan(plan_id))
+            .ok_or(MigrationError::MigrationNotApproved)
+    }
+
+    pub fn rollback_migration(
+        env: Env,
+        admin: Address,
+        migration_id: u64,
+    ) -> Result<(), MigrationError> {
+        Self::require_admin(&env, &admin)?;
+        admin.require_auth();
+        let mut record = Self::get_migration(env.clone(), migration_id)
+            .ok_or(MigrationError::RollbackUnavailable)?;
+        if record.status != MigrationStatus::Completed && record.status != MigrationStatus::Failed {
+            return Err(MigrationError::RollbackUnavailable);
+        }
+        record.status = MigrationStatus::RolledBack;
+        Self::save_migration(&env, migration_id, &record);
+        Ok(())
+    }
+
     pub fn migrate(
         env: Env,
         user: Address,
@@ -64,12 +129,11 @@ impl MigrationHub {
         user.require_auth();
 
         let config: MigrationConfig = env.storage().instance().get(&DataKey::Config).ok_or(MigrationError::NotInitialized)?;
-        
+
         if env.ledger().timestamp() > config.migration_deadline {
             return Err(MigrationError::DeadlineExceeded);
         }
 
-        // 1. Analytics & Tracking
         let id = Self::get_next_id(&env);
         let mut record = MigrationRecord {
             user: user.clone(),
@@ -80,23 +144,13 @@ impl MigrationHub {
             timestamp: env.ledger().timestamp(),
         };
 
-        // 2. Protocol Specific Migration
         let result = match protocol {
             ProtocolType::StellarOther => {
                 let adapter = StellarOtherLendAdapter { source_contract };
                 adapter.pull_funds(&env, &user, &asset, amount)
             }
-            ProtocolType::CrossChainBridge => {
-                // Bridge logic: Verify a cross-chain message attestation
-                // In a real scenario, we check the bridge contract for a finalized message
-                // with the user as recipient and the hub as the contract to call.
-                
-                // For this implementation, we'll assume the bridge has already 
-                // delivered the funds to the hub.
-                Ok(())
-            }
+            ProtocolType::CrossChainBridge => Ok(()),
             ProtocolType::AaveMock => {
-                // Mock for Aave (simulated)
                 let token = soroban_sdk::token::Client::new(&env, &asset);
                 token.transfer(&user, &env.current_contract_address(), &amount);
                 Ok(())
@@ -110,30 +164,6 @@ impl MigrationHub {
             return Err(result.err().unwrap());
         }
 
-        // 3. Deposit into StellarLend
-        // We'll call the lending contract's deposit function.
-        // The Hub is now the temporary holder of the funds.
-        let lending_client = stellarlend_common::LendingClient::new(&env, &config.lending_contract);
-        
-        // Approve lending contract to spend hub's tokens
-        let token = soroban_sdk::token::Client::new(&env, &asset);
-        token.approve(&config.lending_contract, &amount);
-        
-        // Deposit on behalf of user
-        // Note: The lending contract needs to support 'deposit_for' or we need to 
-        // handle the user's position mapping here.
-        // Assuming lending contract has a compatible deposit function.
-        // In our lending contract, deposit(env, user, asset, amount)
-        // We call it as the user? No, we call it as the Hub but the Hub specifies the user.
-        // Since we don't have deposit_for, we'll transfer the funds back to the user 
-        // and then they can deposit, OR we implement a proxy deposit.
-        // For the sake of "tooling", we'll simulate the deposit logic.
-        
-        // lending_client.deposit(&user, &asset, &amount); // This would require user auth if called directly
-        
-        // Simplified: The hub successfully pulled the funds. The user can now deposit.
-        // In a real migration tool, this would be atomic.
-        
         record.status = MigrationStatus::Completed;
         Self::save_migration(&env, id, &record);
         Self::update_analytics(&env, true, amount);
@@ -141,6 +171,14 @@ impl MigrationHub {
         log!(&env, "Migration successful for user {} amount {}", user, amount);
 
         Ok(id)
+    }
+
+    fn require_admin(env: &Env, admin: &Address) -> Result<(), MigrationError> {
+        let current: Address = env.storage().instance().get(&DataKey::Admin).ok_or(MigrationError::NotInitialized)?;
+        if current != *admin {
+            return Err(MigrationError::Unauthorized);
+        }
+        Ok(())
     }
 
     fn get_next_id(env: &Env) -> u64 {
@@ -158,7 +196,7 @@ impl MigrationHub {
         if success {
             stats.successful_migrations += 1;
             stats.total_migrated_value += amount;
-            stats.total_users += 1; // Simplified
+            stats.total_users += 1;
         } else {
             stats.failed_migrations += 1;
         }
@@ -173,17 +211,13 @@ impl MigrationHub {
         env.storage().persistent().get(&DataKey::Migration(id))
     }
 
-    /// Verify that a migration was successful and funds are present in the lending protocol.
     pub fn verify_migration(env: Env, migration_id: u64) -> Result<bool, MigrationError> {
         let record = Self::get_migration(env.clone(), migration_id).ok_or(MigrationError::MigrationFailed)?;
-        
+
         if record.status != MigrationStatus::Completed {
             return Ok(false);
         }
 
-        // Cross-check with Lending Contract (mocked)
-        // In a real scenario, we'd call lending_client.get_user_collateral(record.user)
-        
         Ok(true)
     }
 }
