@@ -1,4 +1,4 @@
-use soroban_sdk::{contracterror, contracttype, Address, String, Vec, Val};
+use soroban_sdk::{contracterror, contracttype, Address, BytesN};
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -13,6 +13,8 @@ pub enum MigrationError {
     BridgeError = 7,
     DeadlineExceeded = 8,
     InsufficientFunds = 9,
+    MigrationNotApproved = 10,
+    RollbackUnavailable = 11,
 }
 
 #[contracttype]
@@ -29,6 +31,7 @@ pub enum MigrationStatus {
     Pending,
     Completed,
     Failed,
+    RolledBack,
 }
 
 #[contracttype]
@@ -44,6 +47,18 @@ pub struct MigrationRecord {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MigrationPlan {
+    pub plan_id: BytesN<32>,
+    pub old_contract: Address,
+    pub new_contract: Address,
+    pub state_root: BytesN<32>,
+    pub approved: bool,
+    pub total_steps: u32,
+    pub completed_steps: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
     Config,
     Migration(u64),
@@ -51,6 +66,7 @@ pub enum DataKey {
     NextMigrationId,
     Analytics,
     Admin,
+    Plan(BytesN<32>),
 }
 
 #[contracttype]
